@@ -5,91 +5,103 @@ import pandas as pd
 import time
 
 # -----------------------------------------------------------
-# 1. 기본 설정 (여기만 확인하세요!)
+# 1. 기본 설정
 # -----------------------------------------------------------
 CONFIG_FILE = "config.json"
 STRATEGY = "RLSentimentStrategy"
 MODEL = "ExtendedMDPLearner"
-TIMERANGE = "20251128-20251204"  # 검증(백테스팅) 기간
-DOWNLOAD_DAYS = 180             # 다운로드할 데이터 기간 (일)
+TIMERANGE = "20240101-20251204"
+DOWNLOAD_DAYS = 730             
 
 # -----------------------------------------------------------
-# 2. 실험할 파라미터 조합 (보상 체계 실험)
+# 2. 실험 파라미터
 # -----------------------------------------------------------
 experiments = [
-    # 실험 1: 공격형 (매수 +2.0, 관망 -0.1, 짧게 학습)
     {"buy_reward": 2.0, "neutral_penalty": -0.1, "train_cycles": 20},
-    
-    # 실험 2: 밸런스형 (매수 +1.0, 관망 -0.05, 적당히 학습)
     {"buy_reward": 1.0, "neutral_penalty": -0.05, "train_cycles": 30},
-    
-    # 실험 3: 신중형 (매수 +0.5, 관망 0.0, 길게 학습)
     {"buy_reward": 0.5, "neutral_penalty": 0.0, "train_cycles": 50},
 ]
 
-def run_command(cmd_list):
-    """명령어를 실행하고 에러 발생 시 중단하는 함수"""
-    print(f"\n[EXEC] {' '.join(cmd_list)}")
+def run_command_visible(cmd_list):
+    """화면에 진행 상황을 그대로 보여주는 실행 함수"""
     try:
+        # stdout, stderr를 캡처하지 않고 그대로 내보냄 -> 진행바가 보임!
         subprocess.run(cmd_list, check=True, shell=True)
-    except subprocess.CalledProcessError as e:
-        print(f"❌ 오류 발생! 스크립트를 중단합니다. 에러 코드: {e.returncode}")
-        exit(1)
+        return True
+    except subprocess.CalledProcessError:
+        return False
 
 # ===========================================================
-# [STEP 1] 데이터 자동 다운로드
+# [STEP 1] 데이터 다운로드 (순차 진행 & 화면 표시)
 # ===========================================================
-print("="*50)
-print(f"🚀 자동화 프로세스 시작: {DOWNLOAD_DAYS}일치 데이터 다운로드")
-print("="*50)
+print("\n" + "="*60)
+print(f"🚀 [STEP 1] {DOWNLOAD_DAYS}일치 데이터 다운로드 시작 (순차 진행)")
+print("   (화면에 Freqtrade 진행바가 표시됩니다.)")
+print("="*60)
 
-# 다운로드 명령어 (기존 데이터 앞에 붙이기 --prepend 사용)
-dl_cmd = [
-    "python", "-m", "freqtrade", "download-data",
-    "--config", CONFIG_FILE,
-    "--days", str(DOWNLOAD_DAYS),
-    "-t", "5m",
-    "--prepend"
-]
-run_command(dl_cmd)
-print("✅ 데이터 다운로드 완료!\n")
+# 종목 리스트 가져오기
+with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+    config_data = json.load(f)
+    pairs = config_data['exchange']['pair_whitelist']
+
+# 한 종목씩 차례대로 다운로드 (진행바를 보기 위해)
+for i, pair in enumerate(pairs):
+    print(f"\n⬇️ [{i+1}/{len(pairs)}] 다운로드 중: {pair}")
+    
+    dl_cmd = [
+        "python", "-m", "freqtrade", "download-data",
+        "--config", CONFIG_FILE,
+        "--days", str(DOWNLOAD_DAYS),
+        "-t", "5m",
+        "--pairs", pair,
+        "--prepend",
+        "--dl-trades" 
+    ]
+    
+    success = run_command_visible(dl_cmd)
+    
+    if success:
+        print(f"✅ {pair} 완료!")
+    else:
+        print(f"❌ {pair} 실패 (네트워크/거래소 오류 가능성)")
+
+print("\n✨ 모든 데이터 다운로드 절차가 끝났습니다!\n")
 
 # ===========================================================
-# [STEP 2] 자동 최적화 실험 루프
+# [STEP 2] 자동 최적화 실험
 # ===========================================================
 results = []
-print("="*50)
-print(f"🧪 총 {len(experiments)}개의 실험을 순차적으로 진행합니다.")
-print("="*50)
+print("="*60)
+print(f"🧪 [STEP 2] 총 {len(experiments)}개의 실험을 시작합니다.")
+print("="*60)
 
 for i, params in enumerate(experiments):
     exp_name = f"auto_exp_{i+1}"
-    print(f"\n▶ [Experiment {i+1}/{len(experiments)}] {exp_name} 시작... {params}")
+    print(f"\n▶ [Experiment {i+1}/{len(experiments)}] {exp_name} 진행 중... {params}")
     
-    # 1. config.json 수정
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             config = json.load(f)
 
-        # 파라미터 주입
-        config["freqai"]["identifier"] = exp_name # 캐시 충돌 방지용 새 이름
+        config["freqai"]["identifier"] = exp_name
         config["freqai"]["rl_config"]["train_cycles"] = params["train_cycles"]
+        config["freqai"]["train_period_days"] = 45
         
-        # 보상 파라미터가 없으면 생성
         if "model_reward_parameters" not in config["freqai"]["rl_config"]:
             config["freqai"]["rl_config"]["model_reward_parameters"] = {}
-            
         config["freqai"]["rl_config"]["model_reward_parameters"]["buy_reward"] = params["buy_reward"]
         config["freqai"]["rl_config"]["model_reward_parameters"]["neutral_penalty"] = params["neutral_penalty"]
+        
+        # 안전장치: CPU 코어 제한 (메모리 보호)
+        config["freqai"]["rl_config"]["cpu_count"] = 4
 
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=4)
             
     except Exception as e:
-        print(f"❌ 설정 파일 수정 중 오류: {e}")
+        print(f"❌ 설정 오류: {e}")
         continue
 
-    # 2. 백테스팅 실행
     bt_cmd = [
         "python", "-m", "freqtrade", "backtesting",
         "--strategy", STRATEGY,
@@ -98,59 +110,43 @@ for i, params in enumerate(experiments):
         "--timerange", TIMERANGE
     ]
     
-    # 학습 및 백테스팅 시작
     start_time = time.time()
-    run_command(bt_cmd)
+    # 백테스팅 진행 상황도 화면에 보이게 설정
+    run_command_visible(bt_cmd)
     duration = time.time() - start_time
     
-    # 3. 결과 파싱 및 저장
+    # 결과 파싱
     try:
         result_dir = "user_data/backtest_results"
-        # 방금 생성된 가장 최신 json 파일 찾기
         files = [os.path.join(result_dir, f) for f in os.listdir(result_dir) if f.endswith(".json") and not f.endswith(".meta.json")]
-        if not files:
-            print("⚠️ 결과 파일을 찾을 수 없습니다.")
-            continue
+        if files:
+            latest_file = max(files, key=os.path.getctime)
+            with open(latest_file, "r") as f:
+                res_data = json.load(f)
             
-        latest_file = max(files, key=os.path.getctime)
-        
-        with open(latest_file, "r") as f:
-            res_data = json.load(f)
-            
-        strat_res = res_data["strategy"][STRATEGY]
-        
-        summary = {
-            "Experiment": exp_name,
-            "Buy_Reward": params["buy_reward"],
-            "Neutral_Penalty": params["neutral_penalty"],
-            "Train_Cycles": params["train_cycles"],
-            "Trades": strat_res["total_trades"],
-            "Win_Rate": f"{strat_res['win_rate'] * 100:.2f}%",
-            "Profit_Ratio": f"{strat_res['profit_total_ratio'] * 100:.2f}%",
-            "Profit_USDT": f"{strat_res['profit_total']:.2f}",
-            "Duration_Sec": int(duration)
-        }
-        results.append(summary)
-        print(f"✅ 실험 {i+1} 성공! (수익률: {summary['Profit_Ratio']}, 거래수: {summary['Trades']})")
-
+            strat_res = res_data["strategy"][STRATEGY]
+            summary = {
+                "Experiment": exp_name,
+                "Buy_Reward": params["buy_reward"],
+                "Trades": strat_res["total_trades"],
+                "Win_Rate": f"{strat_res['win_rate'] * 100:.2f}%",
+                "Profit_Ratio": f"{strat_res['profit_total_ratio'] * 100:.2f}%",
+                "Profit_USDT": f"{strat_res['profit_total']:.2f}",
+                "Drawdown": f"{strat_res['max_drawdown_account'] * 100:.2f}%"
+            }
+            results.append(summary)
+            print(f"✅ 실험 {i+1} 완료. (수익률: {summary['Profit_Ratio']})")
     except Exception as e:
-        print(f"⚠️ 결과 파싱 중 오류 발생: {e}")
+        print(f"⚠️ 결과 집계 중 오류 (무시 가능): {e}")
 
 # ===========================================================
-# [STEP 3] 최종 리포트 출력 및 저장
+# [STEP 3] 리포트 저장
 # ===========================================================
 if results:
     df = pd.DataFrame(results)
     print("\n" + "="*60)
-    print("🏆 최종 실험 결과 리포트")
-    print("="*60)
     print(df)
-    
-    # CSV 저장
-    csv_filename = "final_experiment_results.csv"
-    df.to_csv(csv_filename, index=False)
-    print(f"\n💾 결과가 '{csv_filename}' 파일로 저장되었습니다.")
-else:
-    print("\n❌ 저장된 결과가 없습니다.")
+    df.to_csv("final_result_report.csv", index=False)
+    print(f"\n💾 결과 저장됨: final_result_report.csv")
 
 print("\n😴 모든 작업이 완료되었습니다. 이제 주무셔도 됩니다!")
