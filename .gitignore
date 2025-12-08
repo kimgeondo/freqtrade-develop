@@ -4,6 +4,16 @@
 *.sqlite-shm
 *.sqlite-wal
 
+# Ignore large model files and data files
+user_data/models/*/
+user_data/data/*/
+
+# Ignore large wheel files in build_helpers
+build_helpers/*.whl
+
+# Ignore large test data files
+tests/testdata/orderflow/*.feather
+
 
 # Macos related
 .DS_Store
